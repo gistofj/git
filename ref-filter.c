@@ -76,7 +76,9 @@ static struct used_atom {
 		char color[COLOR_MAXLEN];
 		struct align align;
 		struct {
-			enum { RR_REF, RR_TRACK, RR_TRACKSHORT } option;
+			enum {
+				RR_REF, RR_TRACK, RR_TRACKSHORT, RR_REMOTE_NAME
+			} option;
 			struct refname_atom refname;
 			unsigned int nobracket : 1;
 		} remote_ref;
@@ -156,6 +158,8 @@ static void remote_ref_atom_parser(const struct ref_format *format, struct used_
 			atom->u.remote_ref.option = RR_TRACKSHORT;
 		else if (!strcmp(s, "nobracket"))
 			atom->u.remote_ref.nobracket = 1;
+		else if (!strcmp(s, "remote-name"))
+			atom->u.remote_ref.option = RR_REMOTE_NAME;
 		else {
 			atom->u.remote_ref.option = RR_REF;
 			refname_atom_parser_internal(&atom->u.remote_ref.refname,
@@ -1247,6 +1251,15 @@ static void fill_remote_ref_details(struct used_atom *atom, const char *refname,
 			*s = ">";
 		else
 			*s = "<>";
+	} else if (atom->u.remote_ref.option == RR_REMOTE_NAME) {
+		int explicit;
+		const char *remote = starts_with(atom->name, "push") ?
+			pushremote_for_branch(branch, &explicit) :
+			remote_for_branch(branch, &explicit);
+		if (explicit)
+			*s = xstrdup(remote);
+		else
+			*s = "";
 	} else
 		die("BUG: unhandled RR_* enum");
 }
