@@ -495,22 +495,42 @@ static int batch_objects(struct batch_options *opt)
 	save_warning = warn_on_object_refname_ambiguity;
 	warn_on_object_refname_ambiguity = 0;
 
-	while (strbuf_getline(&buf, stdin) != EOF) {
-		if (data.split_on_whitespace) {
-			/*
-			 * Split at first whitespace, tying off the beginning
-			 * of the string and saving the remainder (or NULL) in
-			 * data.rest.
-			 */
-			char *p = strpbrk(buf.buf, " \t");
-			if (p) {
-				while (*p && strchr(" \t", *p))
-					*p++ = '\0';
+	if (opt.porcelain_format == PORCELAIN_FORMAT_PORCELAIN) {
+		while (strbuf_getline_nul(&buf, stdin) != EOF) {
+			if (data.split_on_whitespace) {
+				/*
+				* Split at first null, tying off the beginning
+				* of the string and saving the remainder (or NULL) in
+				* data.rest.
+				*/
+				char *p = strpbrk(buf.buf, " \0");
+				if (p) {
+					while (*p && strchr(" \0", *p))
+						*p++ = '\0';
+				}
+				data.rest = p;
 			}
-			data.rest = p;
-		}
 
-		batch_one_object(buf.buf, opt, &data);
+			batch_one_object(buf.buf, opt, &data);
+		}
+	} else {
+		while (strbuf_getline(&buf, stdin) != EOF) {
+			if (data.split_on_whitespace) {
+				/*
+				* Split at first whitespace, tying off the beginning
+				* of the string and saving the remainder (or NULL) in
+				* data.rest.
+				*/
+				char *p = strpbrk(buf.buf, " \t");
+				if (p) {
+					while (*p && strchr(" \t", *p))
+						*p++ = '\0';
+				}
+				data.rest = p;
+			}
+
+			batch_one_object(buf.buf, opt, &data);
+		}
 	}
 
 	strbuf_release(&buf);
