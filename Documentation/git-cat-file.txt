@@ -162,6 +162,8 @@ respectively print:
 	/etc/passwd
 --
 
+--porcelain=<version>
+	[[[placeholder for help text.]]]
 
 OUTPUT
 ------
