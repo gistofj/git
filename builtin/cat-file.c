@@ -21,6 +21,7 @@ struct batch_options {
 	int buffer_output;
 	int all_objects;
 	int cmdmode; /* may be 'w' or 'c' for --filters or --textconv */
+	parse_opt_porcelain_format porcelain_format;
 	const char *format;
 };
 
@@ -494,22 +495,42 @@ static int batch_objects(struct batch_options *opt)
 	save_warning = warn_on_object_refname_ambiguity;
 	warn_on_object_refname_ambiguity = 0;
 
-	while (strbuf_getline(&buf, stdin) != EOF) {
-		if (data.split_on_whitespace) {
-			/*
-			 * Split at first whitespace, tying off the beginning
-			 * of the string and saving the remainder (or NULL) in
-			 * data.rest.
-			 */
-			char *p = strpbrk(buf.buf, " \t");
-			if (p) {
-				while (*p && strchr(" \t", *p))
-					*p++ = '\0';
+	if (opt.porcelain_format == PORCELAIN_FORMAT_PORCELAIN) {
+		while (strbuf_getline_nul(&buf, stdin) != EOF) {
+			if (data.split_on_whitespace) {
+				/*
+				* Split at first null, tying off the beginning
+				* of the string and saving the remainder (or NULL) in
+				* data.rest.
+				*/
+				char *p = strpbrk(buf.buf, " \0");
+				if (p) {
+					while (*p && strchr(" \0", *p))
+						*p++ = '\0';
+				}
+				data.rest = p;
 			}
-			data.rest = p;
-		}
 
-		batch_one_object(buf.buf, opt, &data);
+			batch_one_object(buf.buf, opt, &data);
+		}
+	} else {
+		while (strbuf_getline(&buf, stdin) != EOF) {
+			if (data.split_on_whitespace) {
+				/*
+				* Split at first whitespace, tying off the beginning
+				* of the string and saving the remainder (or NULL) in
+				* data.rest.
+				*/
+				char *p = strpbrk(buf.buf, " \t");
+				if (p) {
+					while (*p && strchr(" \t", *p))
+						*p++ = '\0';
+				}
+				data.rest = p;
+			}
+
+			batch_one_object(buf.buf, opt, &data);
+		}
 	}
 
 	strbuf_release(&buf);
@@ -548,6 +569,25 @@ static int batch_option_callback(const struct option *opt,
 	return 0;
 }
 
+static int batch_porcelain_callback(const struct option *opt, const char *arg, int unset)
+{
+	struct batch_options *bo = opt->value;
+
+	enum parse_opt_porcelain_format *value = (enum parse_opt_porcelain_format *)bo->porcelain_format;
+	if (unset)
+		*value = PORCELAIN_FORMAT_NONE;
+	else if (!arg)
+		*value = PORCELAIN_FORMAT_PORCELAIN;
+	else if (!strcmp(arg, "v1") || !strcmp(arg, "1"))
+		*value = PORCELAIN_FORMAT_PORCELAIN;
+	else if (!strcmp(arg, "v2") || !strcmp(arg, "2"))
+		*value = PORCELAIN_FORMAT_PORCELAIN_V2;
+	else
+		die("unsupported porcelain version '%s'", arg);
+
+	return 0;
+}
+
 int cmd_cat_file(int argc, const char **argv, const char *prefix)
 {
 	int opt = 0;
@@ -581,6 +621,9 @@ int cmd_cat_file(int argc, const char **argv, const char *prefix)
 			 N_("follow in-tree symlinks (used with --batch or --batch-check)")),
 		OPT_BOOL(0, "batch-all-objects", &batch.all_objects,
 			 N_("show all objects with --batch or --batch-check")),
+		{ OPTION_CALLBACK, 0, "porcelain", &batch,
+		  N_("version"), N_("machine-readable output"),
+		  PARSE_OPT_OPTARG, batch_porcelain_callback },
 		OPT_END()
 	};
 
@@ -602,6 +645,9 @@ int cmd_cat_file(int argc, const char **argv, const char *prefix)
 			exp_type = argv[0];
 			obj_name = argv[1];
 		} else
+			usage_with_options(cat_file_usage, options);
+		
+		if (batch.porcelain_format != PORCELAIN_FORMAT_NONE)
 			usage_with_options(cat_file_usage, options);
 	}
 	if (batch.enabled) {

@@ -41,6 +41,14 @@ enum parse_opt_option_flags {
 	PARSE_OPT_SHELL_EVAL = 256
 };
 
+enum parse_opt_porcelain_format {
+	PORCELAIN_FORMAT_NONE = 0,
+	PORCELAIN_FORMAT_PORCELAIN,
+	PORCELAIN_FORMAT_PORCELAIN_V2,
+
+	PORCELAIN_FORMAT_UNSPECIFIED
+};
+
 struct option;
 typedef int parse_opt_cb(const struct option *, const char *arg, int unset);
 
