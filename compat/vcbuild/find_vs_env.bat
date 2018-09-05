@@ -79,7 +79,7 @@ REM ================================================================
    SET VSCMD_START_DIR=.
 
    REM Get the root of the VS product installation.
-   FOR /F "usebackq tokens=*" %%i IN (`"%vs_where%" -latest -requires Microsoft.VisualStudio.Workload.NativeDesktop -property installationPath`) DO @SET vs_ip=%%i
+   FOR /F "usebackq tokens=*" %%i IN (`"%vs_where%" -prerelease -nologo -latest -requires Microsoft.VisualStudio.Workload.NativeDesktop -property installationPath`) DO @SET vs_ip=%%i
 
    SET vs_devcmd=%vs_ip%\Common7\Tools\VsDevCmd.bat
    dir "%vs_devcmd%" >nul 2>nul && GOTO have_vs_devcmd
