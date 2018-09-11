@@ -3,10 +3,14 @@
 #include "../win32.h"
 #include "fscache.h"
 
+#define FSCACHE_HASHMAP_INITIAL_SIZE 65535
+#define FSCACHE_MUTEX_SPINWAIT 0
+
 static int initialized;
 static volatile long enabled;
 static struct hashmap map;
-static CRITICAL_SECTION mutex;
+static SRWLOCK rwlock = SRWLOCK_INIT;
+static CONDITION_VARIABLE cond = CONDITION_VARIABLE_INIT;
 static struct trace_key trace_fscache = TRACE_KEY_INIT(FSCACHE);
 
 /*
@@ -32,10 +36,11 @@ struct fsentry {
 	struct fsentry *next;
 
 	union {
-		/* Reference count of the directory listing. */
-		volatile long refcnt;
-		/* Handle to wait on the loading thread. */
-		HANDLE hwait;
+		struct {
+			/* Reference count of the directory listing. */
+			volatile long refcnt;
+			volatile long pending;
+		};
 		struct {
 			/* More stat members (only used for file entries). */
 			off64_t st_size;
@@ -87,6 +92,7 @@ static void fsentry_init(struct fsentry *fse, struct fsentry *list,
 	fse->list = list;
 	fse->name = name;
 	fse->len = len;
+	fse->pending = 0;
 	hashmap_entry_init(fse, fsentry_hash(fse));
 }
 
@@ -167,6 +173,7 @@ static struct fsentry *fseentry_create_entry(struct fsentry *list,
 			fdata->dwReserved0, buf);
 	fse->st_size = S_ISLNK(fse->st_mode) ? MAX_LONG_PATH :
 			fdata->nFileSizeLow | (((off_t) fdata->nFileSizeHigh) << 32);
+				       (((off_t)fdata->nFileSizeHigh) << 32);
 	filetime_to_timespec(&(fdata->ftLastAccessTime), &(fse->st_atim));
 	filetime_to_timespec(&(fdata->ftLastWriteTime), &(fse->st_mtim));
 	filetime_to_timespec(&(fdata->ftCreationTime), &(fse->st_ctim));
@@ -283,15 +290,15 @@ static struct fsentry *fscache_get_wait(struct fsentry *key)
 		return fse;
 
 	/* create an event and link our key to the future entry */
-	key->hwait = CreateEvent(NULL, TRUE, FALSE, NULL);
+	InterlockedExchange(&key->pending, 1);
 	key->next = fse->next;
 	fse->next = key;
 
 	/* wait for the loading thread to signal us */
-	LeaveCriticalSection(&mutex);
-	WaitForSingleObject(key->hwait, INFINITE);
-	CloseHandle(key->hwait);
-	EnterCriticalSection(&mutex);
+	while (InterlockedCompareExchange(&key->pending, 0, 0)) {
+		SleepConditionVariableSRW(&cond, &rwlock, INFINITE,
+					  CONDITION_VARIABLE_LOCKMODE_SHARED);
+	}
 
 	/* repeat cache lookup */
 	return hashmap_get(&map, key, NULL);
@@ -305,7 +312,8 @@ static struct fsentry *fscache_get(struct fsentry *key)
 	struct fsentry *fse, *future, *waiter;
 	int dir_not_found;
 
-	EnterCriticalSection(&mutex);
+	AcquireSRWLockShared(&rwlock);
+
 	/* check if entry is in cache */
 	fse = fscache_get_wait(key);
 	if (fse) {
@@ -313,42 +321,56 @@ static struct fsentry *fscache_get(struct fsentry *key)
 			fsentry_addref(fse);
 		else
 			fse = NULL; /* non-existing directory */
-		LeaveCriticalSection(&mutex);
+
+		ReleaseSRWLockShared(&rwlock);
+
 		return fse;
 	}
 	/* if looking for a file, check if directory listing is in cache */
 	if (!fse && key->list) {
 		fse = fscache_get_wait(key->list);
 		if (fse) {
-			LeaveCriticalSection(&mutex);
 			/*
 			 * dir entry without file entry, or dir does not
 			 * exist -> file doesn't exist
 			 */
 			errno = ENOENT;
+
+			ReleaseSRWLockShared(&rwlock);
+
 			return NULL;
 		}
 	}
+
+	/* upgrade the held lock from reader to writer */
+	ReleaseSRWLockShared(&rwlock);
+	AcquireSRWLockExclusive(&rwlock);
 
 	/* add future entry to indicate that we're loading it */
 	future = key->list ? key->list : key;
 	future->next = NULL;
 	future->refcnt = 0;
+	future->pending = 1;
+
 	hashmap_add(&map, future);
 
-	/* create the directory listing (outside mutex!) */
-	LeaveCriticalSection(&mutex);
+	ReleaseSRWLockExclusive(&rwlock);
+
+	/* create the directory listing (outside lock!) */
 	fse = fsentry_create_list(future, &dir_not_found);
-	EnterCriticalSection(&mutex);
+
+	AcquireSRWLockExclusive(&rwlock);
 
 	/* remove future entry and signal waiting threads */
 	hashmap_remove(&map, future, NULL);
+
 	waiter = future->next;
 	while (waiter) {
-		HANDLE h = waiter->hwait;
+		InterlockedExchange(&waiter->pending, 0);
 		waiter = waiter->next;
-		SetEvent(h);
 	}
+
+	WakeAllConditionVariable(&cond);
 
 	/* leave on error (errno set by fsentry_create_list) */
 	if (!fse) {
@@ -363,12 +385,18 @@ static struct fsentry *fscache_get(struct fsentry *key)
 			fse->st_mode = 0;
 			hashmap_add(&map, fse);
 		}
-		LeaveCriticalSection(&mutex);
+
+		ReleaseSRWLockExclusive(&rwlock);
+
 		return NULL;
 	}
 
 	/* add directory listing to the cache */
 	fscache_add(fse);
+
+	/* downgrade the held lock from writer to reader */
+	ReleaseSRWLockExclusive(&rwlock);
+	AcquireSRWLockShared(&rwlock);
 
 	/* lookup file entry if requested (fse already points to directory) */
 	if (key->list)
@@ -383,7 +411,8 @@ static struct fsentry *fscache_get(struct fsentry *key)
 	else
 		errno = ENOENT;
 
-	LeaveCriticalSection(&mutex);
+	ReleaseSRWLockShared(&rwlock);
+
 	return fse;
 }
 
@@ -400,8 +429,9 @@ int fscache_enable(int enable)
 		if (!core_fscache)
 			return 0;
 
-		InitializeCriticalSection(&mutex);
-		hashmap_init(&map, (hashmap_cmp_fn) fsentry_cmp, NULL, 0);
+		InitializeSRWLock(&rwlock);
+		hashmap_init(&map, (hashmap_cmp_fn)fsentry_cmp, NULL,
+			     FSCACHE_HASHMAP_INITIAL_SIZE);
 		initialized = 1;
 	}
 
@@ -416,9 +446,9 @@ int fscache_enable(int enable)
 		/* reset opendir and lstat to the original implementations */
 		opendir = dirent_opendir;
 		lstat = mingw_lstat;
-		EnterCriticalSection(&mutex);
+		AcquireSRWLockExclusive(&rwlock);
 		fscache_clear();
-		LeaveCriticalSection(&mutex);
+		ReleaseSRWLockExclusive(&rwlock);
 	}
 	trace_printf_key(&trace_fscache, "fscache: enable(%d)\n", enable);
 	return result;
@@ -430,9 +460,9 @@ int fscache_enable(int enable)
 void fscache_flush(void)
 {
 	if (enabled) {
-		EnterCriticalSection(&mutex);
+		AcquireSRWLockExclusive(&rwlock);
 		fscache_clear();
-		LeaveCriticalSection(&mutex);
+		ReleaseSRWLockExclusive(&rwlock);
 	}
 }
 
